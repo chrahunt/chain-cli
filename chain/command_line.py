@@ -17,9 +17,6 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
-logging.basicConfig(level=logging.DEBUG)
-
-
 class Server(object):
     '''
     TCP server that invokes a callback when any data is received.
@@ -107,7 +104,7 @@ class SortableFunction(object):
         self.fn = fn
 
     def __call__(self, *args, **kwargs):
-        self.fn(*args, **kwargs)
+        return self.fn(*args, **kwargs)
 
     def __lt__(self, rhs):
         return self.priority < rhs.priority
@@ -121,28 +118,57 @@ def signal_test():
 
 
 def main():
-    parser = argparse.ArgumentParser(description='run reloadable command')
+    parser = argparse.ArgumentParser(description='''\
+            Run reloadable command. Command can be restarted with
+            a signal (SIGQUIT), or packet sent to provided port.
+
+            If the command has exited then it can be restarted with
+            Enter. To quit, send (SIGTERM).
+            ''')
     parser.add_argument('command', help='the command to run')
     parser.add_argument('--host', default='localhost', help='the host to listen on')
     parser.add_argument('--port', default=9998, type=int, help='port to listen on')
     parser.add_argument('--restart-method', choices=('term', 'kill'), default='term')
+    parser.add_argument('--verbose', help='')
     args = parser.parse_args()
+
+    if args.verbose:
+        logging.basicConfig(level=logging.DEBUG)
+
+    console = logging.getLogger('console')
+    console.setLevel(logging.DEBUG)
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.DEBUG)
+    cf = logging.Formatter('%(asctime)s: %(message)s')
+    ch.setFormatter(cf)
+    console.addHandler(ch)
 
     commands = queue.PriorityQueue()
     # Sources:
     # - tcp server (thread)
     # - command (thread)
     # - signal (none)
-    # - keyboard (main)
+    # - keyboard (thread)
     def handle_process_stop():
-        logger.info('Process has exited.')
-        # TODO: listen for keyboard input
+        console.info('Process has exited. Press Enter to restart or Ctrl-C to exit.')
     ex = Executor(args.command, handle_process_stop)
+
+    # User input is in a dedicated thread that does not keep the monitor
+    # process alive.
+    def handle_user_input():
+        while True:
+            input()
+            if ex.stopped:
+                console.info('Starting process')
+                ex.start()
+    input_thread = threading.Thread(target=handle_user_input)
+    input_thread.daemon = True
+    input_thread.start()
 
     def handle_server_request():
         logger.debug('handle_server_request()')
         def inner():
-            logger.info('Restarting process')
+            console.info('Restarting process')
             ex.send_signal(signal.SIGINT)
             ex.wait()
             ex.start()
@@ -151,8 +177,11 @@ def main():
 
     def handle_sigint(*_):
         logger.debug('handle_sigint()')
+        if ex.stopped:
+            return commands.put(SortableFunction(0, lambda: True))
         def inner():
             ex.send_signal(signal.SIGINT)
+            # quit event loop
             return True
         # Higher priority since we plan to exit.
         commands.put(SortableFunction(0, inner))
@@ -161,23 +190,27 @@ def main():
     def handle_sigquit(*_):
         logger.debug('handle_sigquit()')
         def inner():
-            logger.info('Restarting application')
+            console.info('Restarting application')
             ex.send_signal(signal.SIGINT)
             ex.wait()
             ex.start()
         commands.put(SortableFunction(1, inner))
     signal.signal(signal.SIGQUIT, handle_sigquit)
 
+    console.info('Starting process')
     # Run the command
     ex.start()
     # Start the tcp server
     server.start()
     # Wait for signals or process exit followed by a signal
     while True:
-        if commands.get()():
+        finished = commands.get()()
+        if finished:
             break
 
-    logger.info('Stopping application')
+    console.info('Exiting')
     server.stop()
     # Additional signals may come at this point and will be directed to the child.
-    ex.wait()
+    if not ex.stopped:
+        console.info('Waiting for application')
+        ex.wait()

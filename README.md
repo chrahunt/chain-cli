@@ -56,4 +56,5 @@ Reference:
 - command can be anything valid in shell
 - sigquit (`Ctrl-\`) sent to command will result in reload of application or restart of application
 - Enter sent to command when not running will result in restart of command
+- Ctrl-C send to process when not running will quit
 - stdin/stdout are sent to application when running
